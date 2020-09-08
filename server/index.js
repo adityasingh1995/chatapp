@@ -1,4 +1,5 @@
 "user strict";
+// Database
 const knex = require('knex')({
 	client: 'pg',
 	connection: {
@@ -9,30 +10,116 @@ const knex = require('knex')({
 	}
 });
 
+// Cache
+const redis = require('redis');
+const promises = require('bluebird');
+redis.RedisClient.prototype = promises.promisifyAll(redis.RedisClient.prototype);
+redis.Multi.prototype = promises.promisifyAll(redis.RedisClient.prototype);
+const redisClient = redis.createClient();
+redisClient.on('error', function(error) {
+	console.error(error);
+	throw error;
+});
+
+// Webserver
 const Koa = require('koa');
 const app = new Koa();
+app.keys = ['supersecretkey123'];
 
 // Set up middlewares
+const cookieFieldName = 'chatapp!session!id';
 
+// 1. Body Parser
 const bodyParser = require('koa-bodyparser');
 app.use(bodyParser());
+
+// 2. Session
+app.use(async (ctxt, next) => {
+	const sessionId = ctxt.cookies.get(cookieFieldName, {
+		'signed': true
+	});
+
+	if(!sessionId) {
+		await next();
+		return;
+	}
+
+	let sessionData = await redisClient.getAsync(sessionId);
+
+	if(!sessionData) {
+		ctxt.cookies.set(cookieFieldName);
+		await next();
+		return;
+	}
+
+	sessionData = JSON.parse(sessionData);
+
+	let user = await knex.raw('SELECT id FROM users WHERE id = ?', [sessionData.user_id]);
+	user = user.rows.length ? user.rows.shift() : null;
+
+	if(!user){
+		redisClient.del(sessionId);
+		ctxt.cookies.set(cookieFieldName);
+		await next();
+		return;
+	}
+
+	await redisClient.setexAsync(sessionId, (24 * 60 * 60), JSON.stringify(sessionData));
+
+	ctxt.cookies.set(cookieFieldName, sessionId, {
+		'maxAge': (24 * 60 * 60 * 1000),
+		'signed': true,
+		'secure': false,
+		'httpOnly': true,
+		'overwrite': true	
+	});
+
+	ctxt.state.user = user;
+	await next();
+});
+
+const ensureLoggedIn = async (ctxt, next) => {
+	if(!ctxt.state.user) {
+		ctxt.redirect('/login');
+		return;
+	}
+
+	await next();
+};
 
 // Set up routes
 const Router = require('koa-router');
 const router = new Router();
 
-router.get('/', async (ctxt, next) => {
+router.get('/', ensureLoggedIn, async (ctxt, next) => {
 	// Selects default user, sends it to frontend
 	const defaultUser = await knex('users')
 	.where({
-		'user_name': 'root'
+		'id': ctxt.state.user.id
 	})
 	.select();
 
-	ctxt.body = `Welcome User ${defaultUser[0].name}`;
+	ctxt.body = `
+<!DOCTYPE html>
+<head>
+	Chatapp
+</head>
+<body>
+	Welcome User ${defaultUser[0].name}
+	<form method="post" action="/logout">
+		<div class="container">
+			<button type="submit">Logout</button>
+		</div>
+	</form>
+</body>`
 });
 
 router.get('/login', async (ctxt, next) => {
+	if(ctxt.state.user) {
+		ctxt.redirect('/')
+		return;
+	}
+
 	const loginTemplate = `
 <!DOCTYPE html>
 <head>
@@ -55,12 +142,68 @@ router.get('/login', async (ctxt, next) => {
 	ctxt.body = loginTemplate; 
 });
 
+const uuid = require('uuid');
+
 router.post('/login', async (ctxt, next) => {
-	console.log('got params:', ctxt.request.body);
-	ctxt.status = 301;
+	if(ctxt.state.user) {
+		ctxt.redirect('/');
+		return;
+	}
+
+	let user = await knex.raw(`SELECT * FROM users WHERE user_name = ?`, [ctxt.request.body['uname']]);
+	user = user.rows.length ? user.rows.shift() : null;
+
+	if(!user) {
+		ctxt.throw(401, 'Invalid Credentials');
+		return;
+	}
+
+	const passwordMatch = (user.password === ctxt.request.body.psw)// await bcrypt.compare(ctxt.request.body.psswd, user['password']);
+	if(!passwordMatch) {
+		ctxt.throw(401, 'Invalid Credentials');
+		return;
+	}
+
+	// store session data in cache;
+	const sessionData = JSON.stringify({
+		'user_id': user.id
+	});
+
+	const sessionKey = uuid.v4();
+	await redisClient.setexAsync(sessionKey, (24 * 60 * 60), sessionData);
+	ctxt.cookies.set(cookieFieldName, sessionKey, {
+		'maxAge': (24 * 60 * 60 * 1000),
+		'signed': true,
+		'secure': false,
+		'httpOnly': true,
+		'overwrite': true
+	});
+
 	ctxt.redirect('/');
+	ctxt.body = 'Logged In Succesfully';
 });
 
+router.post('/logout', async (ctxt, next) => {
+	if(!ctxt.state.user) {
+		ctxt.redirect('/login')
+		return;
+	}
+
+	const sessionId = ctxt.cookies.get(cookieFieldName, {
+		'secure': false
+	});
+
+	if(!sessionId) {
+		ctxt.redirect('/login')
+		return;
+	}
+
+	ctxt.cookies.set(cookieFieldName);
+	await redisClient.delAsync(sessionId);
+
+	ctxt.redirect('/login');
+	ctxt.body = 'Logged Out';
+});
 
 app
 .use(router.routes())
