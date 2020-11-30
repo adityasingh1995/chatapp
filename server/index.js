@@ -54,7 +54,7 @@ app.use(async (ctxt, next) => {
 
 	sessionData = JSON.parse(sessionData);
 
-	let user = await knex.raw('SELECT id FROM users WHERE id = ?', [sessionData.user_id]);
+	let user = await knex.raw('SELECT id, user_name, name FROM users WHERE id = ?', [sessionData.user_id]);
 	user = user.rows.length ? user.rows.shift() : null;
 
 	if(!user){
@@ -91,6 +91,7 @@ const ensureLoggedIn = async (ctxt, next) => {
 const Router = require('koa-router');
 const router = new Router();
 
+/*
 router.get('/', ensureLoggedIn, async (ctxt, next) => {
 	// Selects default user, sends it to frontend
 	const defaultUser = await knex('users')
@@ -113,6 +114,15 @@ router.get('/', ensureLoggedIn, async (ctxt, next) => {
 	</form>
 </body>`
 });
+*/
+
+router.get('/user', async(ctxt, next) => {
+	ctxt.body = 'Hello';
+	if(ctxt.state.user)
+		ctxt.body = JSON.stringify(ctxt.state.user);
+	return;
+});
+
 
 router.get('/login', async (ctxt, next) => {
 	if(ctxt.state.user) {
@@ -204,6 +214,31 @@ router.post('/logout', async (ctxt, next) => {
 	ctxt.redirect('/login');
 	ctxt.body = 'Logged Out';
 });
+
+// Serve static files
+const send = require('koa-send');
+router.get('/public', async (ctxt, next) => {
+	console.log('hit');
+	const path = require('path');
+	const root = path.join(path.dirname(__dirname), 'frontend/public');
+	console.log(root, ctxt.path);
+	const filePath = path.relative('/public', ctxt.path);
+
+	if(!filePath) {
+		ctxt.throw(404, 'No Path Specified');
+		return;
+	}
+
+
+
+	await send(ctxt, filePath, { root: root});
+});
+
+/*
+router.get('/', async (ctxt, next) => {
+	await send(ctxt, 'frontend/index.html');
+});
+*/
 
 app
 .use(router.routes())
